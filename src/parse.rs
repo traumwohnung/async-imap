@@ -23,7 +23,7 @@ pub(crate) fn parse_names<T: Stream<Item = io::Result<ResponseData>> + Unpin + S
             async move {
                 match resp {
                     Ok(resp) => match resp.parsed() {
-                        Response::MailboxData(MailboxDatum::List { .. }) => {
+                        Response::MailboxData(MailboxDatum::List(..)) => {
                             let name = Name::from_mailbox_data(resp);
                             Some(Ok(name))
                         }
@@ -103,8 +103,7 @@ pub(crate) async fn parse_status<T: Stream<Item = io::Result<ResponseData>> + Un
             Response::Done {
                 tag,
                 status,
-                code,
-                information,
+                outcome,
                 ..
             } if tag == &command_tag => {
                 use imap_proto::Status;
@@ -113,14 +112,21 @@ pub(crate) async fn parse_status<T: Stream<Item = io::Result<ResponseData>> + Un
                         break;
                     }
                     Status::Bad => {
-                        return Err(Error::Bad(format!("code: {code:?}, info: {information:?}")));
+                        return Err(Error::Bad(format!(
+                            "code: {:?}, info: {:?}",
+                            outcome.code, outcome.information
+                        )));
                     }
                     Status::No => {
-                        return Err(Error::No(format!("code: {code:?}, info: {information:?}")));
+                        return Err(Error::No(format!(
+                            "code: {:?}, info: {:?}",
+                            outcome.code, outcome.information
+                        )));
                     }
                     _ => {
                         return Err(Error::Io(io::Error::other(format!(
-                            "status: {status:?}, code: {code:?}, information: {information:?}"
+                            "status: {status:?}, code: {:?}, information: {:?}",
+                            outcome.code, outcome.information
                         ))));
                     }
                 }
@@ -236,8 +242,7 @@ pub(crate) async fn parse_mailbox<T: Stream<Item = io::Result<ResponseData>> + U
             Response::Done {
                 tag,
                 status,
-                code,
-                information,
+                outcome,
                 ..
             } if tag == &command_tag => {
                 use imap_proto::Status;
@@ -246,29 +251,32 @@ pub(crate) async fn parse_mailbox<T: Stream<Item = io::Result<ResponseData>> + U
                         break;
                     }
                     Status::Bad => {
-                        return Err(Error::Bad(format!("code: {code:?}, info: {information:?}")));
+                        return Err(Error::Bad(format!(
+                            "code: {:?}, info: {:?}",
+                            outcome.code, outcome.information
+                        )));
                     }
                     Status::No => {
-                        return Err(Error::No(format!("code: {code:?}, info: {information:?}")));
+                        return Err(Error::No(format!(
+                            "code: {:?}, info: {:?}",
+                            outcome.code, outcome.information
+                        )));
                     }
                     _ => {
                         return Err(Error::Io(io::Error::other(format!(
-                            "status: {status:?}, code: {code:?}, information: {information:?}"
+                            "status: {status:?}, code: {:?}, information: {:?}",
+                            outcome.code, outcome.information
                         ))));
                     }
                 }
             }
-            Response::Data {
-                status,
-                code,
-                information,
-            } => {
+            Response::Data { status, outcome } => {
                 use imap_proto::Status;
 
                 match status {
                     Status::Ok => {
                         use imap_proto::ResponseCode;
-                        match code {
+                        match &outcome.code {
                             Some(ResponseCode::UidValidity(uid)) => {
                                 mailbox.uid_validity = Some(*uid);
                             }
@@ -290,14 +298,21 @@ pub(crate) async fn parse_mailbox<T: Stream<Item = io::Result<ResponseData>> + U
                         }
                     }
                     Status::Bad => {
-                        return Err(Error::Bad(format!("code: {code:?}, info: {information:?}")));
+                        return Err(Error::Bad(format!(
+                            "code: {:?}, info: {:?}",
+                            outcome.code, outcome.information
+                        )));
                     }
                     Status::No => {
-                        return Err(Error::No(format!("code: {code:?}, info: {information:?}")));
+                        return Err(Error::No(format!(
+                            "code: {:?}, info: {:?}",
+                            outcome.code, outcome.information
+                        )));
                     }
                     _ => {
                         return Err(Error::Io(io::Error::other(format!(
-                            "status: {status:?}, code: {code:?}, information: {information:?}"
+                            "status: {status:?}, code: {:?}, information: {:?}",
+                            outcome.code, outcome.information
                         ))));
                     }
                 }
@@ -315,7 +330,7 @@ pub(crate) async fn parse_mailbox<T: Stream<Item = io::Result<ResponseData>> + U
                         .flags
                         .extend(flags.iter().map(|s| (*s).to_string()).map(Flag::from));
                 }
-                MailboxDatum::List { .. } => {}
+                MailboxDatum::List(..) => {}
                 MailboxDatum::MetadataSolicited { .. } => {}
                 MailboxDatum::MetadataUnsolicited { .. } => {}
                 MailboxDatum::Search { .. } => {}

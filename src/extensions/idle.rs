@@ -168,7 +168,7 @@ impl<T: Read + Write + Unpin + fmt::Debug + Send> Handle<T> {
                     } => {
                         // all good continue
                     }
-                    Response::Continue { .. } => {
+                    Response::Continue(..) => {
                         // continuation, wait for it
                     }
                     Response::Done { .. } => {
@@ -188,13 +188,13 @@ impl<T: Read + Write + Unpin + fmt::Debug + Send> Handle<T> {
         self.id = Some(id);
         while let Some(res) = self.session.stream.try_next().await? {
             match res.parsed() {
-                Response::Continue { .. } => {
+                Response::Continue(..) => {
                     return Ok(());
                 }
                 Response::Done {
                     tag,
                     status,
-                    information,
+                    outcome,
                     ..
                 } => {
                     if tag == self.id.as_ref().unwrap()
@@ -202,7 +202,7 @@ impl<T: Read + Write + Unpin + fmt::Debug + Send> Handle<T> {
                     {
                         return Err(std::io::Error::new(
                             std::io::ErrorKind::ConnectionRefused,
-                            information.as_ref().unwrap().to_string(),
+                            outcome.information.as_ref().unwrap().to_string(),
                         )
                         .into());
                     }

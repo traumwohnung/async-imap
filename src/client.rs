@@ -210,20 +210,23 @@ impl<T: Read + Write + Unpin + fmt::Debug + Send> Client<T> {
 
             if let Response::Done {
                 status,
-                code,
-                information,
+                outcome,
                 tag,
             } = res.parsed()
             {
                 ok_or_unauth_client_err!(
-                    self.check_status_ok(status, code.as_ref(), information.as_deref()),
+                    self.check_status_ok(
+                        status,
+                        outcome.code.as_ref(),
+                        outcome.information.as_deref(),
+                    ),
                     self
                 );
 
                 if *tag == id {
                     let capabilities =
                         if let Some(imap_proto::types::ResponseCode::Capabilities(capabilities)) =
-                            code
+                            &outcome.code
                         {
                             use crate::types::{Capabilities, Capability};
                             let capability_set: HashSet<Capability> =
@@ -308,8 +311,8 @@ impl<T: Read + Write + Unpin + fmt::Debug + Send> Client<T> {
                 return Err((Error::ConnectionLost, self));
             };
             match res.parsed() {
-                Response::Continue { information, .. } => {
-                    let challenge = if let Some(text) = information {
+                Response::Continue(outcome) => {
+                    let challenge = if let Some(text) = &outcome.information {
                         ok_or_unauth_client_err!(
                             base64::engine::general_purpose::STANDARD
                                 .decode(text.as_ref())
@@ -1177,7 +1180,7 @@ impl<T: Read + Write + Unpin + fmt::Debug + Send> Session<T> {
         let Some(res) = self.read_response().await? else {
             return Err(Error::Append);
         };
-        let Response::Continue { .. } = res.parsed() else {
+        let Response::Continue(..) = res.parsed() else {
             return Err(Error::Append);
         };
 
@@ -1465,12 +1468,15 @@ impl<T: Read + Write + Unpin + fmt::Debug> Connection<T> {
         loop {
             if let Response::Done {
                 status,
-                code,
-                information,
+                outcome,
                 tag,
             } = response.parsed()
             {
-                self.check_status_ok(status, code.as_ref(), information.as_deref())?;
+                self.check_status_ok(
+                    status,
+                    outcome.code.as_ref(),
+                    outcome.information.as_deref(),
+                )?;
 
                 if tag == id {
                     return Ok(());
@@ -1578,8 +1584,10 @@ mod tests {
             actual_response.parsed(),
             &Response::Data {
                 status: Status::Ok,
-                code: None,
-                information: Some(Cow::Borrowed("Dovecot ready.")),
+                outcome: imap_proto::Outcome {
+                    code: None,
+                    information: Some(Cow::Borrowed("Dovecot ready.")),
+                },
             }
         );
     }
@@ -2285,10 +2293,10 @@ mod tests {
     #[test]
     fn validate_newline() {
         if let Err(ref e) = validate_str("test\nstring") {
-            if let Error::Validate(ve) = e {
-                if ve.0 == '\n' {
-                    return;
-                }
+            if let Error::Validate(ve) = e
+                && ve.0 == '\n'
+            {
+                return;
             }
             panic!("Wrong error: {e:?}");
         }
@@ -2299,10 +2307,10 @@ mod tests {
     #[allow(unreachable_patterns)]
     fn validate_carriage_return() {
         if let Err(ref e) = validate_str("test\rstring") {
-            if let Error::Validate(ve) = e {
-                if ve.0 == '\r' {
-                    return;
-                }
+            if let Error::Validate(ve) = e
+                && ve.0 == '\r'
+            {
+                return;
             }
             panic!("Wrong error: {e:?}");
         }

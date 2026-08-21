@@ -26,14 +26,10 @@ pub struct InnerName<'a> {
 impl Name {
     pub(crate) fn from_mailbox_data(resp: ResponseData) -> Self {
         Name::new(Box::new(resp), |response| match response.parsed() {
-            Response::MailboxData(MailboxDatum::List {
-                name_attributes,
-                delimiter,
-                name,
-            }) => InnerName {
-                attributes: name_attributes.to_owned(),
-                delimiter: delimiter.as_deref(),
-                name,
+            Response::MailboxData(MailboxDatum::List(data)) => InnerName {
+                attributes: data.name_attributes.to_owned(),
+                delimiter: data.delimiter.as_deref(),
+                name: &data.name,
             },
             _ => panic!("cannot construct from non mailbox data"),
         })
