@@ -1959,6 +1959,27 @@ mod tests {
 
     #[cfg_attr(feature = "runtime-tokio", tokio::test)]
     #[cfg_attr(feature = "runtime-async-std", async_std::test)]
+    async fn uid_search_esearch() {
+        // IMAP4rev2 servers answer with ESEARCH (RFC 9051 section 7.3.4).
+        let response = b"* ESEARCH (TAG \"A0001\") UID ALL 1:3,5\r\n\
+            A0001 OK UID SEARCH completed\r\n"
+            .to_vec();
+        let mock_stream = MockStream::new(response);
+        let mut session = mock_session!(mock_stream);
+        let ids = session.uid_search("ALL").await.unwrap();
+        assert_eq!(ids, [1, 2, 3, 5].into_iter().collect());
+
+        let response = b"* ESEARCH (TAG \"A0001\") UID\r\n\
+            A0001 OK UID SEARCH completed\r\n"
+            .to_vec();
+        let mock_stream = MockStream::new(response);
+        let mut session = mock_session!(mock_stream);
+        let ids = session.uid_search("ALL").await.unwrap();
+        assert!(ids.is_empty());
+    }
+
+    #[cfg_attr(feature = "runtime-tokio", tokio::test)]
+    #[cfg_attr(feature = "runtime-async-std", async_std::test)]
     async fn uid_search_unordered() {
         let response = b"* SEARCH 1 2 3 4 5\r\n\
             A0002 OK CAPABILITY completed\r\n\

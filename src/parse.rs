@@ -3,9 +3,9 @@ use std::collections::HashSet;
 use async_channel as channel;
 use futures_util::stream::Stream;
 use futures_util::{StreamExt as _, TryStreamExt as _, io};
-use imap_proto::{self, MailboxDatum, Metadata, RequestId, Response};
+use imap_proto::{self, MailboxDatum, Metadata, RequestId, Response, SearchReturnData};
 
-use crate::error::{Error, Result};
+use crate::error::{Error, ParseError, Result};
 use crate::types::ResponseData;
 use crate::types::*;
 
@@ -346,12 +346,29 @@ pub(crate) async fn parse_mailbox<T: Stream<Item = io::Result<ResponseData>> + U
     Ok(mailbox)
 }
 
+/// Upper bound on the ids expanded from `ESEARCH` `ALL` items of one command.
+const MAX_ESEARCH_IDS: u64 = 1 << 24;
+
+/// Collects the ids of a `SEARCH` or `UID SEARCH` command.
+///
+/// IMAP4rev1 servers answer with `SEARCH` responses. IMAP4rev2 servers answer
+/// with `ESEARCH` (RFC 9051 section 7.3.4) whose `ALL` item carries the ids;
+/// without `RETURN` options a search behaves as `RETURN (ALL)`, and an
+/// `ESEARCH` without `ALL` means nothing matched. An `ESEARCH` correlated
+/// with another command's tag is passed on as unsolicited.
+///
+/// An `ALL` sequence-set is compact, so a server could announce far more ids
+/// than any mailbox holds; more than [`MAX_ESEARCH_IDS`] expanded ids fail the
+/// command once its responses have been consumed. So does an `ALL` value that
+/// is not a plain sequence-set (e.g. one using `*`), rather than silently
+/// dropping the ids it stands for.
 pub(crate) async fn parse_ids<T: Stream<Item = io::Result<ResponseData>> + Unpin>(
     stream: &mut T,
     unsolicited: channel::Sender<UnsolicitedResponse>,
     command_tag: RequestId,
 ) -> Result<HashSet<u32>> {
     let mut ids: HashSet<u32> = HashSet::new();
+    let mut esearch_error: Option<String> = None;
 
     while let Some(resp) = stream
         .take_while(|res| filter(res, &command_tag))
@@ -364,13 +381,57 @@ pub(crate) async fn parse_ids<T: Stream<Item = io::Result<ResponseData>> + Unpin
                     ids.insert(*c);
                 }
             }
+            Response::MailboxData(MailboxDatum::ESearch {
+                correlator, data, ..
+            }) if correlator.as_deref().is_none_or(|tag| tag == command_tag.0) => {
+                // Keep only the first failure, but consume every response.
+                if esearch_error.is_none() {
+                    esearch_error = collect_esearch_ids(&mut ids, data).err();
+                }
+            }
             _ => {
                 handle_unilateral(resp, unsolicited.clone());
             }
         }
     }
 
+    if let Some(message) = esearch_error {
+        return Err(Error::Parse(ParseError::Unexpected(message)));
+    }
     Ok(ids)
+}
+
+/// Adds the ids of the `ALL` items of one `ESEARCH` response to `ids`.
+///
+/// Fails when the ids would exceed [`MAX_ESEARCH_IDS`] or when an `ALL` value
+/// is not a plain sequence-set; `ids` may then hold a partial result.
+fn collect_esearch_ids(
+    ids: &mut HashSet<u32>,
+    data: &[SearchReturnData<'_>],
+) -> std::result::Result<(), String> {
+    for item in data {
+        match item {
+            SearchReturnData::All(ranges) => {
+                for range in ranges {
+                    // A sequence-set range may be given in either order.
+                    let (a, b) = (*range.start(), *range.end());
+                    let (low, high) = (a.min(b), a.max(b));
+                    if ids.len() as u64 + u64::from(high - low) + 1 > MAX_ESEARCH_IDS {
+                        return Err(format!("ESEARCH result exceeds {MAX_ESEARCH_IDS} ids"));
+                    }
+                    ids.extend(low..=high);
+                }
+            }
+            SearchReturnData::Other { name, value } if name.eq_ignore_ascii_case("ALL") => {
+                return Err(format!(
+                    "ESEARCH ALL is not a sequence-set: {:?}",
+                    String::from_utf8_lossy(value)
+                ));
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 /// Parses [GETMETADATA](https://www.rfc-editor.org/info/rfc5464) response.
@@ -743,6 +804,73 @@ mod tests {
         assert!(recv.is_empty());
         let ids: HashSet<u32> = ids.iter().cloned().collect();
         assert_eq!(ids, HashSet::<u32>::new());
+    }
+
+    #[cfg_attr(feature = "runtime-tokio", tokio::test)]
+    #[cfg_attr(feature = "runtime-async-std", async_std::test)]
+    async fn parse_ids_esearch() {
+        // Stalwart 0.16 in IMAP4rev2 mode.
+        let (send, recv) = bounded(10);
+        let responses = input_stream(&["* ESEARCH (TAG \"A0006\") UID\r\n"]);
+        let mut stream = async_std::stream::from_iter(responses);
+        let ids = parse_ids(&mut stream, send, RequestId("A0006".into()))
+            .await
+            .unwrap();
+        assert!(recv.is_empty());
+        assert_eq!(ids, HashSet::<u32>::new());
+
+        let (send, recv) = bounded(10);
+        let responses = input_stream(&[
+            "* ESEARCH (TAG \"A0009\") UID ALL 1:2\r\n",
+            "* ESEARCH UID ALL 9:7,12\r\n",
+            "* ESEARCH (TAG \"A0008\") UID ALL 5\r\n",
+            "* ESEARCH (TAG \"A0009\") UID COUNT 3 MIN 1 MAX 2\r\n",
+        ]);
+        let mut stream = async_std::stream::from_iter(responses);
+        let ids = parse_ids(&mut stream, send, RequestId("A0009".into()))
+            .await
+            .unwrap();
+        assert_eq!(ids, [1, 2, 7, 8, 9, 12].into_iter().collect());
+        // The response for another command is not attributed to this one.
+        match recv.recv().await.unwrap() {
+            UnsolicitedResponse::Other(res) => assert!(matches!(
+                res.parsed(),
+                Response::MailboxData(MailboxDatum::ESearch { correlator: Some(tag), .. })
+                    if tag == "A0008"
+            )),
+            other => panic!("unexpected unsolicited response {other:?}"),
+        }
+        assert!(recv.is_empty());
+
+        // A compact but absurd ALL set fails instead of exhausting memory.
+        let (send, recv) = bounded(10);
+        let responses = input_stream(&[
+            "* ESEARCH (TAG \"A0010\") UID ALL 1:4294967295\r\n",
+            "* 3 EXISTS\r\n",
+        ]);
+        let mut stream = async_std::stream::from_iter(responses);
+        let result = parse_ids(&mut stream, send, RequestId("A0010".into())).await;
+        assert!(matches!(
+            result,
+            Err(Error::Parse(ParseError::Unexpected(_)))
+        ));
+        // The remaining responses were still consumed.
+        assert_eq!(recv.recv().await.unwrap(), UnsolicitedResponse::Exists(3));
+
+        // An ALL set that is not a plain sequence-set fails instead of
+        // silently losing ids.
+        for all in ["1:*", "1,4294967296"] {
+            let (send, recv) = bounded(10);
+            let line = format!("* ESEARCH (TAG \"A0011\") UID ALL {all}\r\n");
+            let responses = input_stream(&[&line, "* 4 EXISTS\r\n"]);
+            let mut stream = async_std::stream::from_iter(responses);
+            let result = parse_ids(&mut stream, send, RequestId("A0011".into())).await;
+            assert!(
+                matches!(result, Err(Error::Parse(ParseError::Unexpected(_)))),
+                "{all}: {result:?}"
+            );
+            assert_eq!(recv.recv().await.unwrap(), UnsolicitedResponse::Exists(4));
+        }
     }
 
     #[cfg_attr(feature = "runtime-tokio", tokio::test)]
