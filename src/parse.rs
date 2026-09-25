@@ -347,7 +347,7 @@ pub(crate) async fn parse_mailbox<T: Stream<Item = io::Result<ResponseData>> + U
 }
 
 /// Upper bound on the ids expanded from `ESEARCH` `ALL` items of one command.
-pub(crate) const MAX_ESEARCH_IDS: u64 = 1 << 24;
+const MAX_ESEARCH_IDS: u64 = 1 << 24;
 
 /// Collects the ids of a `SEARCH` or `UID SEARCH` command.
 ///
@@ -384,37 +384,9 @@ pub(crate) async fn parse_ids<T: Stream<Item = io::Result<ResponseData>> + Unpin
             Response::MailboxData(MailboxDatum::ESearch {
                 correlator, data, ..
             }) if correlator.as_deref().is_none_or(|tag| tag == command_tag.0) => {
-                for item in data {
-                    match item {
-                        SearchReturnData::All(ranges) => {
-                            for range in ranges {
-                                // A sequence-set range may be given in either order.
-                                let (a, b) = (*range.start(), *range.end());
-                                let (low, high) = (a.min(b), a.max(b));
-                                let len = u64::from(high - low) + 1;
-                                if esearch_error.is_some() {
-                                    break;
-                                } else if ids.len() as u64 + len > MAX_ESEARCH_IDS {
-                                    esearch_error = Some(format!(
-                                        "ESEARCH result exceeds {MAX_ESEARCH_IDS} ids"
-                                    ));
-                                } else {
-                                    ids.extend(low..=high);
-                                }
-                            }
-                        }
-                        SearchReturnData::Other { name, value }
-                            if name.eq_ignore_ascii_case("ALL") =>
-                        {
-                            esearch_error.get_or_insert_with(|| {
-                                format!(
-                                    "ESEARCH ALL is not a sequence-set: {:?}",
-                                    String::from_utf8_lossy(value)
-                                )
-                            });
-                        }
-                        _ => {}
-                    }
+                // Keep only the first failure, but consume every response.
+                if esearch_error.is_none() {
+                    esearch_error = collect_esearch_ids(&mut ids, data).err();
                 }
             }
             _ => {
@@ -427,6 +399,39 @@ pub(crate) async fn parse_ids<T: Stream<Item = io::Result<ResponseData>> + Unpin
         return Err(Error::Parse(ParseError::Unexpected(message)));
     }
     Ok(ids)
+}
+
+/// Adds the ids of the `ALL` items of one `ESEARCH` response to `ids`.
+///
+/// Fails when the ids would exceed [`MAX_ESEARCH_IDS`] or when an `ALL` value
+/// is not a plain sequence-set; `ids` may then hold a partial result.
+fn collect_esearch_ids(
+    ids: &mut HashSet<u32>,
+    data: &[SearchReturnData<'_>],
+) -> std::result::Result<(), String> {
+    for item in data {
+        match item {
+            SearchReturnData::All(ranges) => {
+                for range in ranges {
+                    // A sequence-set range may be given in either order.
+                    let (a, b) = (*range.start(), *range.end());
+                    let (low, high) = (a.min(b), a.max(b));
+                    if ids.len() as u64 + u64::from(high - low) + 1 > MAX_ESEARCH_IDS {
+                        return Err(format!("ESEARCH result exceeds {MAX_ESEARCH_IDS} ids"));
+                    }
+                    ids.extend(low..=high);
+                }
+            }
+            SearchReturnData::Other { name, value } if name.eq_ignore_ascii_case("ALL") => {
+                return Err(format!(
+                    "ESEARCH ALL is not a sequence-set: {:?}",
+                    String::from_utf8_lossy(value)
+                ));
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 /// Parses [GETMETADATA](https://www.rfc-editor.org/info/rfc5464) response.
