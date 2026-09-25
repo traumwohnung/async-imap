@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use async_channel as channel;
 use futures_util::stream::Stream;
 use futures_util::{StreamExt as _, TryStreamExt as _, io};
-use imap_proto::{self, MailboxDatum, Metadata, RequestId, Response};
+use imap_proto::{self, MailboxDatum, Metadata, RequestId, Response, SearchReturnData};
 
 use crate::error::{Error, Result};
 use crate::types::ResponseData;
@@ -346,6 +346,13 @@ pub(crate) async fn parse_mailbox<T: Stream<Item = io::Result<ResponseData>> + U
     Ok(mailbox)
 }
 
+/// Collects the ids of a `SEARCH` or `UID SEARCH` command.
+///
+/// IMAP4rev1 servers answer with `SEARCH` responses. IMAP4rev2 servers answer
+/// with `ESEARCH` (RFC 9051 section 7.3.4) whose `ALL` item carries the ids;
+/// without `RETURN` options a search behaves as `RETURN (ALL)`, and an
+/// `ESEARCH` without `ALL` means nothing matched. An `ESEARCH` correlated
+/// with another command's tag is passed on as unsolicited.
 pub(crate) async fn parse_ids<T: Stream<Item = io::Result<ResponseData>> + Unpin>(
     stream: &mut T,
     unsolicited: channel::Sender<UnsolicitedResponse>,
@@ -362,6 +369,19 @@ pub(crate) async fn parse_ids<T: Stream<Item = io::Result<ResponseData>> + Unpin
             Response::MailboxData(MailboxDatum::Search(cs)) => {
                 for c in cs {
                     ids.insert(*c);
+                }
+            }
+            Response::MailboxData(MailboxDatum::ESearch {
+                correlator, data, ..
+            }) if correlator.as_deref().is_none_or(|tag| tag == command_tag.0) => {
+                for item in data {
+                    if let SearchReturnData::All(ranges) = item {
+                        for range in ranges {
+                            // A sequence-set range may be given in either order.
+                            let (a, b) = (*range.start(), *range.end());
+                            ids.extend(a.min(b)..=a.max(b));
+                        }
+                    }
                 }
             }
             _ => {
@@ -743,6 +763,43 @@ mod tests {
         assert!(recv.is_empty());
         let ids: HashSet<u32> = ids.iter().cloned().collect();
         assert_eq!(ids, HashSet::<u32>::new());
+    }
+
+    #[cfg_attr(feature = "runtime-tokio", tokio::test)]
+    #[cfg_attr(feature = "runtime-async-std", async_std::test)]
+    async fn parse_ids_esearch() {
+        // Stalwart 0.16 in IMAP4rev2 mode.
+        let (send, recv) = bounded(10);
+        let responses = input_stream(&["* ESEARCH (TAG \"A0006\") UID\r\n"]);
+        let mut stream = async_std::stream::from_iter(responses);
+        let ids = parse_ids(&mut stream, send, RequestId("A0006".into()))
+            .await
+            .unwrap();
+        assert!(recv.is_empty());
+        assert_eq!(ids, HashSet::<u32>::new());
+
+        let (send, recv) = bounded(10);
+        let responses = input_stream(&[
+            "* ESEARCH (TAG \"A0009\") UID ALL 1:2\r\n",
+            "* ESEARCH UID ALL 9:7,12\r\n",
+            "* ESEARCH (TAG \"A0008\") UID ALL 5\r\n",
+            "* ESEARCH (TAG \"A0009\") UID COUNT 3 MIN 1 MAX 2\r\n",
+        ]);
+        let mut stream = async_std::stream::from_iter(responses);
+        let ids = parse_ids(&mut stream, send, RequestId("A0009".into()))
+            .await
+            .unwrap();
+        assert_eq!(ids, [1, 2, 7, 8, 9, 12].into_iter().collect());
+        // The response for another command is not attributed to this one.
+        match recv.recv().await.unwrap() {
+            UnsolicitedResponse::Other(res) => assert!(matches!(
+                res.parsed(),
+                Response::MailboxData(MailboxDatum::ESearch { correlator: Some(tag), .. })
+                    if tag == "A0008"
+            )),
+            other => panic!("unexpected unsolicited response {other:?}"),
+        }
+        assert!(recv.is_empty());
     }
 
     #[cfg_attr(feature = "runtime-tokio", tokio::test)]
