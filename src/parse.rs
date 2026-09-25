@@ -359,14 +359,16 @@ pub(crate) const MAX_ESEARCH_IDS: u64 = 1 << 24;
 ///
 /// An `ALL` sequence-set is compact, so a server could announce far more ids
 /// than any mailbox holds; more than [`MAX_ESEARCH_IDS`] expanded ids fail the
-/// command once its responses have been consumed.
+/// command once its responses have been consumed. So does an `ALL` value that
+/// is not a plain sequence-set (e.g. one using `*`), rather than silently
+/// dropping the ids it stands for.
 pub(crate) async fn parse_ids<T: Stream<Item = io::Result<ResponseData>> + Unpin>(
     stream: &mut T,
     unsolicited: channel::Sender<UnsolicitedResponse>,
     command_tag: RequestId,
 ) -> Result<HashSet<u32>> {
     let mut ids: HashSet<u32> = HashSet::new();
-    let mut esearch_overflow = false;
+    let mut esearch_error: Option<String> = None;
 
     while let Some(resp) = stream
         .take_while(|res| filter(res, &command_tag))
@@ -383,18 +385,35 @@ pub(crate) async fn parse_ids<T: Stream<Item = io::Result<ResponseData>> + Unpin
                 correlator, data, ..
             }) if correlator.as_deref().is_none_or(|tag| tag == command_tag.0) => {
                 for item in data {
-                    if let SearchReturnData::All(ranges) = item {
-                        for range in ranges {
-                            // A sequence-set range may be given in either order.
-                            let (a, b) = (*range.start(), *range.end());
-                            let (low, high) = (a.min(b), a.max(b));
-                            let len = u64::from(high - low) + 1;
-                            if esearch_overflow || ids.len() as u64 + len > MAX_ESEARCH_IDS {
-                                esearch_overflow = true;
-                            } else {
-                                ids.extend(low..=high);
+                    match item {
+                        SearchReturnData::All(ranges) => {
+                            for range in ranges {
+                                // A sequence-set range may be given in either order.
+                                let (a, b) = (*range.start(), *range.end());
+                                let (low, high) = (a.min(b), a.max(b));
+                                let len = u64::from(high - low) + 1;
+                                if esearch_error.is_some() {
+                                    break;
+                                } else if ids.len() as u64 + len > MAX_ESEARCH_IDS {
+                                    esearch_error = Some(format!(
+                                        "ESEARCH result exceeds {MAX_ESEARCH_IDS} ids"
+                                    ));
+                                } else {
+                                    ids.extend(low..=high);
+                                }
                             }
                         }
+                        SearchReturnData::Other { name, value }
+                            if name.eq_ignore_ascii_case("ALL") =>
+                        {
+                            esearch_error.get_or_insert_with(|| {
+                                format!(
+                                    "ESEARCH ALL is not a sequence-set: {:?}",
+                                    String::from_utf8_lossy(value)
+                                )
+                            });
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -404,10 +423,8 @@ pub(crate) async fn parse_ids<T: Stream<Item = io::Result<ResponseData>> + Unpin
         }
     }
 
-    if esearch_overflow {
-        return Err(Error::Parse(ParseError::Unexpected(format!(
-            "ESEARCH result exceeds {MAX_ESEARCH_IDS} ids"
-        ))));
+    if let Some(message) = esearch_error {
+        return Err(Error::Parse(ParseError::Unexpected(message)));
     }
     Ok(ids)
 }
@@ -834,6 +851,21 @@ mod tests {
         ));
         // The remaining responses were still consumed.
         assert_eq!(recv.recv().await.unwrap(), UnsolicitedResponse::Exists(3));
+
+        // An ALL set that is not a plain sequence-set fails instead of
+        // silently losing ids.
+        for all in ["1:*", "1,4294967296"] {
+            let (send, recv) = bounded(10);
+            let line = format!("* ESEARCH (TAG \"A0011\") UID ALL {all}\r\n");
+            let responses = input_stream(&[&line, "* 4 EXISTS\r\n"]);
+            let mut stream = async_std::stream::from_iter(responses);
+            let result = parse_ids(&mut stream, send, RequestId("A0011".into())).await;
+            assert!(
+                matches!(result, Err(Error::Parse(ParseError::Unexpected(_)))),
+                "{all}: {result:?}"
+            );
+            assert_eq!(recv.recv().await.unwrap(), UnsolicitedResponse::Exists(4));
+        }
     }
 
     #[cfg_attr(feature = "runtime-tokio", tokio::test)]
