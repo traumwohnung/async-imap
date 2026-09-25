@@ -5,7 +5,7 @@ use futures_util::stream::Stream;
 use futures_util::{StreamExt as _, TryStreamExt as _, io};
 use imap_proto::{self, MailboxDatum, Metadata, RequestId, Response, SearchReturnData};
 
-use crate::error::{Error, Result};
+use crate::error::{Error, ParseError, Result};
 use crate::types::ResponseData;
 use crate::types::*;
 
@@ -346,6 +346,9 @@ pub(crate) async fn parse_mailbox<T: Stream<Item = io::Result<ResponseData>> + U
     Ok(mailbox)
 }
 
+/// Upper bound on the ids expanded from `ESEARCH` `ALL` items of one command.
+pub(crate) const MAX_ESEARCH_IDS: u64 = 1 << 24;
+
 /// Collects the ids of a `SEARCH` or `UID SEARCH` command.
 ///
 /// IMAP4rev1 servers answer with `SEARCH` responses. IMAP4rev2 servers answer
@@ -353,12 +356,17 @@ pub(crate) async fn parse_mailbox<T: Stream<Item = io::Result<ResponseData>> + U
 /// without `RETURN` options a search behaves as `RETURN (ALL)`, and an
 /// `ESEARCH` without `ALL` means nothing matched. An `ESEARCH` correlated
 /// with another command's tag is passed on as unsolicited.
+///
+/// An `ALL` sequence-set is compact, so a server could announce far more ids
+/// than any mailbox holds; more than [`MAX_ESEARCH_IDS`] expanded ids fail the
+/// command once its responses have been consumed.
 pub(crate) async fn parse_ids<T: Stream<Item = io::Result<ResponseData>> + Unpin>(
     stream: &mut T,
     unsolicited: channel::Sender<UnsolicitedResponse>,
     command_tag: RequestId,
 ) -> Result<HashSet<u32>> {
     let mut ids: HashSet<u32> = HashSet::new();
+    let mut esearch_overflow = false;
 
     while let Some(resp) = stream
         .take_while(|res| filter(res, &command_tag))
@@ -379,7 +387,13 @@ pub(crate) async fn parse_ids<T: Stream<Item = io::Result<ResponseData>> + Unpin
                         for range in ranges {
                             // A sequence-set range may be given in either order.
                             let (a, b) = (*range.start(), *range.end());
-                            ids.extend(a.min(b)..=a.max(b));
+                            let (low, high) = (a.min(b), a.max(b));
+                            let len = u64::from(high - low) + 1;
+                            if esearch_overflow || ids.len() as u64 + len > MAX_ESEARCH_IDS {
+                                esearch_overflow = true;
+                            } else {
+                                ids.extend(low..=high);
+                            }
                         }
                     }
                 }
@@ -390,6 +404,11 @@ pub(crate) async fn parse_ids<T: Stream<Item = io::Result<ResponseData>> + Unpin
         }
     }
 
+    if esearch_overflow {
+        return Err(Error::Parse(ParseError::Unexpected(format!(
+            "ESEARCH result exceeds {MAX_ESEARCH_IDS} ids"
+        ))));
+    }
     Ok(ids)
 }
 
@@ -800,6 +819,21 @@ mod tests {
             other => panic!("unexpected unsolicited response {other:?}"),
         }
         assert!(recv.is_empty());
+
+        // A compact but absurd ALL set fails instead of exhausting memory.
+        let (send, recv) = bounded(10);
+        let responses = input_stream(&[
+            "* ESEARCH (TAG \"A0010\") UID ALL 1:4294967295\r\n",
+            "* 3 EXISTS\r\n",
+        ]);
+        let mut stream = async_std::stream::from_iter(responses);
+        let result = parse_ids(&mut stream, send, RequestId("A0010".into())).await;
+        assert!(matches!(
+            result,
+            Err(Error::Parse(ParseError::Unexpected(_)))
+        ));
+        // The remaining responses were still consumed.
+        assert_eq!(recv.recv().await.unwrap(), UnsolicitedResponse::Exists(3));
     }
 
     #[cfg_attr(feature = "runtime-tokio", tokio::test)]
